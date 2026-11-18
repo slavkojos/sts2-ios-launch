@@ -26,9 +26,11 @@
     <Reference Include="$(GameDataDir)/*.dll" Exclude="$(GameDataDir)/GodotSharp.dll;$(GameDataDir)/sts2.dll" />
     <Reference Include="$(PatchedDir)/GodotSharp.dll" />
     <Reference Include="$(PatchedDir)/sts2.dll" />
+    <Reference Include="$(PatchedDir)/STS2MobileIos.dll" />
     <TrimmerRootAssembly Include="sts2" />
     <TrimmerRootAssembly Include="sts2native" />
     <TrimmerRootAssembly Include="GodotSharp" />
+    <TrimmerRootAssembly Include="STS2MobileIos" />
     <TrimmerRootAssembly Include="SmartFormat" />
     <TrimmerRootAssembly Include="SmartFormat.ZString" />
     <UnmanagedEntryPointsAssembly Include="sts2" />

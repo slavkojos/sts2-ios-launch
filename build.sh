@@ -31,6 +31,7 @@ Usage: ./build.sh --game <folder> [options]
                       iPhone Duo Simulator (Xcode 27.1+). With --install, installs on --device <simulator udid> or
                       the booted Simulator. Rendering there is only approximate (src/ios/simulator_metal.m).
   --bundle-id <id>    App bundle ID. Default: com.sts2ios.<team id> (or com.sts2ios.app when unsigned).
+  --display-name <n>  Home-screen name of the unsigned .ipa, e.g. to tell a second install (own --bundle-id) apart.
   --xcode <path>      Xcode (26 or newer) to build with. Default: the newest in /Applications, ~/Applications and
                       ~/Downloads. Xcode 27.1+ makes the game fill an iPhone Duo's screens (see README).
   --icon game         Use the game's own pixel-art icon instead of rendering the Ironclad close-up.
@@ -52,7 +53,7 @@ show() { local p="${1#$ROOT/}"; echo "$p"; }
 step() { echo "==> $*"; }
 
 GAME_DIR="${STS2_GAME_DIR:-}"; TEAM=""; UNSIGNED=0; INSTALL=0; DEVICE=""; BUNDLE_ID=""; XCODE_APP="${XCODE_APP:-}"; SIM=0
-ICON_MODE="ironclad"; CLEAN=0
+ICON_MODE="ironclad"; CLEAN=0; DISPLAY_NAME=""
 OTA=1; OTA_URL="https://github.com/FlyingViet/sts2-ios-launch/releases/download/ota/"; SHADERS=""
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -63,6 +64,7 @@ while [[ $# -gt 0 ]]; do
 		--device) DEVICE="$2"; shift 2 ;;
 		--simulator) SIM=1; shift ;;
 		--bundle-id) BUNDLE_ID="$2"; shift 2 ;;
+		--display-name) DISPLAY_NAME="$2"; shift 2 ;;
 		--xcode) XCODE_APP="$2"; shift 2 ;;
 		--icon) ICON_MODE="$2"; shift 2 ;;
 		--clean) CLEAN=1; shift ;;
@@ -320,6 +322,11 @@ if ! up_to_date export "$FP" || [[ ! -d "$X/sts2.xcodeproj" ]]; then
 	sed -e "s|@EXPORT_PATH@|$X/sts2.ipa|" -e "s|@TEMPLATE@|$TOOLS/godot/templates/ios.zip|" -e "s|@TEAM@|$EXPORT_TEAM|" \
 		-e "s|@BUNDLE_ID@|$BUNDLE_ID|" -e "s|@VERSION@|$SHORT_VERSION|" "$ROOT/src/godot/export_presets.cfg.in" > "$P/export_presets.cfg"
 	cp -R "$TOOLS/fmod" "$P/addons/fmod" && cp -R "$TOOLS/spine" "$P/addons/spine"
+	# Godot 4.5.1's SVG importer (ThorVG) can crash on FMOD's editor icons that embed a PNG. They're
+	# editor-only and never reach the app, so replace them with a blank icon.
+	for f in "$P"/addons/fmod/icons/*.svg; do
+		grep -q '<image' "$f" && printf '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"/>\n' > "$f"
+	done
 	cp "$WORK/icon.png" "$P/icon.png"
 	# The .NET editor needs dotnet on PATH (set above), else it blocks on a hidden alert. Import crashes at exit: harmless.
 	(cd "$P" && "$GODOT" --headless --path . --import > "$LOGS/godot-import.log" 2>&1) || true
@@ -364,7 +371,7 @@ for ref in "$DOTNET_ROOT"/packs/Microsoft.NETCore.App.Ref/*/ref/net9.0/*.dll "$D
 	[[ -f "$ref" ]] && rm -f "$WORK/game-data/$(basename "$ref")"
 done
 rm -f "$WORK/game-data/System.Private.CoreLib.dll"
-FP="$(fingerprint "$ROOT/src/patcher" "$ROOT/src/native" "$WORK/game-data" "$IOS_SDK" "$TOOLS_ID")"
+FP="$(fingerprint "$ROOT/src/patcher" "$ROOT/src/native" "$ROOT/src/extras" "$ROOT/src/weaver" "$WORK/game-data" "$IOS_SDK" "$TOOLS_ID")"
 if ! up_to_date native "$FP" || [[ ! -f "$WORK/native-out/sts2native.dylib" ]]; then
 	step "Restoring stock GodotSharp $GODOT_VERSION"
 	run restore dotnet restore "$WORK/proj/sts2.csproj"
@@ -376,6 +383,17 @@ if ! up_to_date native "$FP" || [[ ! -f "$WORK/native-out/sts2native.dylib" ]]; 
 	if ! (cd "$WORK/patcher" && run patch-sts2 dotnet run -c Release --no-build -- "$WORK/game-data/sts2.dll" "$WORK/patched/sts2.dll"); then
 		die "patching sts2.dll failed (game version $GAME_VERSION; tested with $TESTED_GAME_VERSION)"
 	fi
+	# Gameplay extras (src/extras): build the hook assembly against the patched game, then weave its hooks in.
+	step "Weaving in the extras (Restart Room, save slots, card advisor)"
+	rm -rf "$WORK/extras" "$WORK/weaver" && cp -R "$ROOT/src/extras" "$WORK/extras" && cp -R "$ROOT/src/weaver" "$WORK/weaver"
+	(cd "$WORK/extras" && run extras-build dotnet build -c Release -o "$WORK/extras-out" -p:PatchedDir="$WORK/patched")
+	[[ -f "$WORK/extras-out/STS2MobileIos.dll" ]] || die "extras build failed (see $(show "$LOGS/extras-build.log"))"
+	cp "$WORK/extras-out/STS2MobileIos.dll" "$WORK/patched/STS2MobileIos.dll"
+	mv "$WORK/patched/sts2.dll" "$WORK/patched/sts2.unwoven.dll"
+	(cd "$WORK/weaver" && WEAVER_REFS="$WORK/game-data" run weave dotnet run -c Release -- "$WORK/patched/sts2.unwoven.dll" \
+		"$WORK/patched/STS2MobileIos.dll" "$WORK/extras/manifest.json" "$WORK/patched/sts2.dll")
+	[[ -f "$WORK/patched/sts2.dll" ]] || die "weaving the extras failed (see $(show "$LOGS/weave.log"))"
+	rm -f "$WORK/patched/sts2.unwoven.dll"
 	step "Compiling the game for iOS (NativeAOT, takes a few minutes)"
 	rm -rf "$WORK/native" "$WORK/native-out" && cp -R "$ROOT/src/native" "$WORK/native"
 	(cd "$WORK/native" && run native-publish dotnet publish -c Release -o "$WORK/native-out" \
@@ -546,6 +564,22 @@ if [[ $UNSIGNED -eq 1 ]]; then
 	step "Packaging the .ipa"
 	rm -rf "$WORK/ipa" "$BUILD/SlayTheSpire2.ipa" && mkdir -p "$WORK/ipa/Payload"
 	cp -c -R "$APP" "$WORK/ipa/Payload/" 2>/dev/null || cp -R "$APP" "$WORK/ipa/Payload/"
+	if [[ -n "$DISPLAY_NAME" ]]; then
+		plutil -replace CFBundleDisplayName -string "$DISPLAY_NAME" "$WORK/ipa/Payload/sts2.app/Info.plist" \
+			|| die "couldn't set the display name"
+		echo "Display name: $DISPLAY_NAME"
+	fi
+	# Ask for the increased memory limit (Save & Quit and the shader warm-up can otherwise get the app killed);
+	# AltStore re-signs the app and keeps the entitlements its signing supports.
+	cat > "$WORK/ent_altstore.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>com.apple.developer.kernel.increased-memory-limit</key><true/>
+</dict></plist>
+PLIST
+	for fw in "$WORK/ipa/Payload/sts2.app/Frameworks/"*.framework; do codesign -f -s - "$fw" >/dev/null 2>&1; done
+	codesign -f -s - --entitlements "$WORK/ent_altstore.plist" "$WORK/ipa/Payload/sts2.app" >/dev/null
 	(cd "$WORK/ipa" && run ipa zip -qr -1 "$BUILD/SlayTheSpire2.ipa" Payload)
 	rm -rf "$WORK/ipa"
 	echo

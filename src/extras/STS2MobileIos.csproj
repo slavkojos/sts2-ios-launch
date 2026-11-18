@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Gameplay extras from jhaizhou-ops/sts2-ios (Restart Room, save slots, card advisor,
+    reward-screen crash fix). build.sh weaves the hooks listed in manifest.json into the patched sts2.dll with
+    src/weaver, and NativeAOT compiles this assembly with the rest. Set by build.sh: GameDataDir, PatchedDir.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AssemblyName>STS2MobileIos</AssemblyName>
+    <RootNamespace>STS2MobileIos</RootNamespace>
+    <NoWarn>$(NoWarn);CS8632;CS0168;CS0219</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="sts2"><HintPath>$(PatchedDir)/sts2.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="GodotSharp"><HintPath>$(PatchedDir)/GodotSharp.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+</Project>

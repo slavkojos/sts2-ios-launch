@@ -195,6 +195,12 @@ else if (asm.Name.Name == "sts2")
 	// startup) when the whole game is compiled ahead of time.
 	Stub("MegaCrit.Sts2.Core.Helpers.OneTimeInitialization", "PrewarmJit", il => il.Emit(OpCodes.Ret));
 
+	// With the aspect ratio setting on Auto, the main menu and global UI pick their own content scale on every
+	// window resize, while port/display.gd sets another one on the same signal: each resize triggers the other
+	// until the stack overflows at the main menu. display.gd owns the content scale on iOS.
+	Stub("MegaCrit.Sts2.Core.Nodes.Screens.MainMenu.NMainMenu", "OnWindowChange", il => il.Emit(OpCodes.Ret));
+	Stub("MegaCrit.Sts2.Core.Nodes.CommonUi.NGlobalUi", "OnWindowChange", il => il.Emit(OpCodes.Ret));
+
 	// Saves made on PC are tagged with the Steam platform; answer those lookups without Steamworks.
 	Stub("MegaCrit.Sts2.Core.Platform.Steam.SteamPlatformUtilStrategy", "GetLocalPlayerId", il =>
 	{
@@ -328,7 +334,7 @@ else if (asm.Name.Name == "sts2")
 		il.Emit(OpCodes.Ret);
 		il.Append(vanilla);
 		il.Emit(OpCodes.Ret);
-		var sites = new List<(MethodDefinition Method, Instruction Four)>();
+		var sites = new List<(MethodDefinition Method, Instruction Four, string Callee)>();
 		foreach (var t in module.GetTypes().Where(t => !t.FullName.Contains("NMultiplayerTest")))
 			foreach (var m in t.Methods.Where(m => m.HasBody))
 			{
@@ -337,13 +343,15 @@ else if (asm.Name.Name == "sts2")
 					if (list[i].OpCode == OpCodes.Ldc_I4_4 && list[i + 1].Operand is MethodReference r
 						&& (r.Name is "StartENetHost" or "InitializeMultiplayerAsHost" || (r.Name == ".ctor" && r.DeclaringType.Name == "StartRunLobby"))
 						&& r.Parameters.Count > 0 && r.Parameters[^1].ParameterType.MetadataType == MetadataType.Int32)
-						sites.Add((m, list[i]));
+						sites.Add((m, list[i], $"{r.DeclaringType.Name}.{r.Name}"));
 			}
-		foreach (var (m, four) in sites)
+		foreach (var (m, four, _) in sites)
 			InsertAfter(m, four, Instruction.Create(OpCodes.Call, lanMax));
 		int caps = sites.Count;
-		// StartENetHost x2 (new / loaded run), InitializeMultiplayerAsHost x2 (standard / custom), Daily lobby x1
-		if (caps != 5) throw new Exception($"expected 5 hard-coded host player caps, found {caps}");
+		// StartENetHost x2 (new / loaded run), InitializeMultiplayerAsHost x2 (standard / custom), Daily lobby x1.
+		// v0.113 adds the Blitz and Dread modes, each with its own InitializeMultiplayerAsHost: 7.
+		foreach (var (m, _, callee) in sites) Console.WriteLine($"  host cap site: {m.DeclaringType.Name} -> {callee}");
+		if (caps is not (5 or 7)) throw new Exception($"expected 5 (v0.107) or 7 (v0.113) hard-coded host player caps, found {caps}");
 		patched++;
 		Console.WriteLine($"host player caps go through PortHooks.LanMaxPlayers ({caps} sites)");
 	}
@@ -353,9 +361,16 @@ else if (asm.Name.Name == "sts2")
 	// maxMultiplayerAscensionUnlocked (an ascension level, 0-20), so slots 0-3 serialize exactly as before and a PC
 	// (which can host for iOS but never join an iOS host) sees the same bytes.
 	{
-		var lp = module.GetType("MegaCrit.Sts2.Core.Entities.Multiplayer.LobbyPlayer");
+		// v0.113 renamed it StartRunLobbyPlayer and replaced the 32-bit maxMultiplayerAscensionUnlocked with an 8-bit
+		// maxStandardAscension, so there the high slot bit rides in bit 7 instead of bit 24.
+		var lp = module.GetType("MegaCrit.Sts2.Core.Entities.Multiplayer.LobbyPlayer")
+			?? module.GetType("MegaCrit.Sts2.Core.Entities.Multiplayer.StartRunLobbyPlayer")
+			?? throw new Exception("LobbyPlayer / StartRunLobbyPlayer not found");
 		var slot = lp.Fields.Single(f => f.Name == "slotId");
-		var asc = lp.Fields.Single(f => f.Name == "maxMultiplayerAscensionUnlocked");
+		var asc = lp.Fields.SingleOrDefault(f => f.Name == "maxMultiplayerAscensionUnlocked")
+			?? lp.Fields.Single(f => f.Name == "maxStandardAscension");
+		sbyte bit = asc.Name == "maxStandardAscension" ? (sbyte)7 : (sbyte)24;
+		int ascMask = (1 << bit) - 1;
 		Instruction Load(MethodDefinition m, FieldDefinition f) =>
 			m.Body.Instructions.Single(i => i.OpCode == OpCodes.Ldfld && i.Operand == f);
 
@@ -366,7 +381,7 @@ else if (asm.Name.Name == "sts2")
 		InsertAfter(ser, Load(ser, asc),
 			Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldfld, slot),
 			Instruction.Create(OpCodes.Ldc_I4_2), Instruction.Create(OpCodes.Shr),
-			Instruction.Create(OpCodes.Ldc_I4_S, (sbyte)24), Instruction.Create(OpCodes.Shl),
+			Instruction.Create(OpCodes.Ldc_I4_S, bit), Instruction.Create(OpCodes.Shl),
 			Instruction.Create(OpCodes.Or));
 
 		var de = Method(lp.FullName, "Deserialize");
@@ -376,16 +391,16 @@ else if (asm.Name.Name == "sts2")
 			Instruction.Create(OpCodes.Ldarg_0),
 			Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldfld, slot),
 			Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldfld, asc),
-			Instruction.Create(OpCodes.Ldc_I4_S, (sbyte)24), Instruction.Create(OpCodes.Shr),
+			Instruction.Create(OpCodes.Ldc_I4_S, bit), Instruction.Create(OpCodes.Shr),
 			Instruction.Create(OpCodes.Ldc_I4_2), Instruction.Create(OpCodes.Shl),
 			Instruction.Create(OpCodes.Or), Instruction.Create(OpCodes.Stfld, slot),
 			// maxMultiplayerAscensionUnlocked &= 0xFFFFFF
 			Instruction.Create(OpCodes.Ldarg_0),
 			Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldfld, asc),
-			Instruction.Create(OpCodes.Ldc_I4, 0xFFFFFF), Instruction.Create(OpCodes.And),
+			Instruction.Create(OpCodes.Ldc_I4, ascMask), Instruction.Create(OpCodes.And),
 			Instruction.Create(OpCodes.Stfld, asc));
 		patched += 2;
-		Console.WriteLine("LobbyPlayer slots 4-5 carry their high bit in maxMultiplayerAscensionUnlocked");
+		Console.WriteLine($"{lp.Name} slots 4-5 carry their high bit in bit {bit} of {asc.Name}");
 	}
 
 	// The rest site scene has four character seats and the treasure room four multiplayer relic holders (one relic
@@ -409,6 +424,14 @@ else if (asm.Name.Name == "sts2")
 	{
 		var coll = module.GetType("MegaCrit.Sts2.Core.Nodes.Screens.TreasureRoomRelic.NTreasureRoomRelicCollection");
 		var ready = Method(coll.FullName, "_Ready");
+		// v0.113 replaced the numbered holders with Layout1..Layout6 (one per relic count), so 5-6 players already
+		// have holders there. Keep the hook field (src/native sets it) but leave _Ready alone.
+		if (coll.Fields.Any(f => f.Name == "_holderLayouts"))
+		{
+			Field("TreasureRelicHolders", Generic("Action", module.ImportReference(coll.Fields.Single(f => f.Name == "_relicContainer").FieldType)));
+			Console.WriteLine("NTreasureRoomRelicCollection already has 6 holder layouts (v0.113+): no hook");
+			goto treasureDone;
+		}
 		var set = ready.Body.Instructions.Single(i => i.OpCode == OpCodes.Call && i.Operand is MethodReference r && r.Name == "set_SingleplayerRelicHolder");
 		// Next: "ldloc.0; GetChildren()" collects the multiplayer holders from the "Container" node held in local 0.
 		if (set.Next.OpCode != OpCodes.Ldloc_0) throw new Exception("NTreasureRoomRelicCollection._Ready changed");
@@ -421,6 +444,7 @@ else if (asm.Name.Name == "sts2")
 		patched++;
 		Console.WriteLine("NTreasureRoomRelicCollection._Ready calls PortHooks.TreasureRelicHolders before collecting holders");
 	}
+	treasureDone:
 
 	// Network error popups offer only "Report bug" (a feedback form sent to Mega Crit) for errors like timeouts,
 	// with no way to just close them. An unofficial port shouldn't file reports: always show OK.

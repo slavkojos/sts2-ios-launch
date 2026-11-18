@@ -160,7 +160,10 @@ static class PortMp
 	// Hands the joined game's service to PortKeepAlive, which keeps the session running while the app isn't in front.
 	sealed class TrackedConnection(IClientConnectionInitializer inner) : IClientConnectionInitializer
 	{
-		public Task<NetErrorInfo?> Connect(NetClientGameService gameService, System.Threading.CancellationToken cancelToken = default)
+		// v0.113: Connect takes the INetClientGameService interface, and the initializer reports its platform and host.
+		public MegaCrit.Sts2.Core.Platform.PlatformType Platform => inner.Platform;
+		public ulong? GetHostId() => inner.GetHostId();
+		public Task<NetErrorInfo?> Connect(MegaCrit.Sts2.Core.Multiplayer.Game.INetClientGameService gameService, System.Threading.CancellationToken cancelToken = default)
 		{
 			PortKeepAlive.Track(() => gameService.IsConnected);
 			return inner.Connect(gameService, cancelToken);
@@ -204,11 +207,12 @@ static class PortMp
 
 	// ---- six players ----
 	// The game hosts at most 4. Raising the cap (PortHooks.LanPlayerCap, read where the game passed 4) needs:
-	//  - LobbyPlayer.slotId: 2 bits on the wire; slots 4-5 carry the extra bit (patched Serialize/Deserialize),
-	//  - rest site seats and treasure relic holders for players 5-6 (the scenes have four of each).
+	//  - StartRunLobbyPlayer.slotId: 2 bits on the wire; slots 4-5 carry the extra bit in bit 7 of the 8-bit
+	//    maxStandardAscension (patched Serialize/Deserialize),
+	//  - rest site seats for players 5-6 (the scene has four; v0.113's treasure room already has 6 relic layouts).
 	// A PC can't join an iOS host (its Join is localhost-only), so only patched devices see slots 4-5.
 
-	// Checks the patched LobbyPlayer encoding before allowing more than 4 players: slots 0-5 must round-trip and
+	// Checks the patched StartRunLobbyPlayer encoding before allowing more than 4 players: slots 0-5 must round-trip and
 	// slots 0-3 must produce exactly the game's original bytes.
 	static void EnableSixPlayers()
 	{
@@ -220,28 +224,32 @@ static class PortMp
 			var reader = new PacketReader();
 			for (int slot = 0; slot < MaxPlayers; slot++)
 			{
-				var p = new LobbyPlayer
+				var p = new StartRunLobbyPlayer
 				{
 					id = 1001UL + (ulong)slot, slotId = slot, character = character, unlockState = new SerializableUnlockState(),
-					maxMultiplayerAscensionUnlocked = 3 * slot, isReady = slot % 2 == 1,
+					maxStandardAscension = 3 * slot, maxBlitzAscension = slot, isModded = slot == 2, isReady = slot % 2 == 1,
 				};
 				writer.Reset();
 				p.Serialize(writer);
 				byte[] bytes = writer.Buffer.AsSpan(0, writer.BytePosition).ToArray();
 				reader.Reset(bytes);
-				var q = new LobbyPlayer();
+				var q = new StartRunLobbyPlayer();
 				q.Deserialize(reader);
-				if (q.id != p.id || q.slotId != p.slotId || q.maxMultiplayerAscensionUnlocked != p.maxMultiplayerAscensionUnlocked
+				if (q.id != p.id || q.slotId != p.slotId || q.maxStandardAscension != p.maxStandardAscension
+					|| q.maxBlitzAscension != p.maxBlitzAscension || q.isModded != p.isModded
 					|| q.isReady != p.isReady || q.character != p.character)
-					throw new Exception($"slot {slot} read back as slot {q.slotId}, ascension {q.maxMultiplayerAscensionUnlocked}");
+					throw new Exception($"slot {slot} read back as slot {q.slotId}, ascension {q.maxStandardAscension}");
 				if (slot < 4)
 				{
 					vanilla.Reset();
-					vanilla.WriteULong(p.id);
+					vanilla.WriteULong(p.id, 64);
 					vanilla.WriteInt(p.slotId, 2);
 					vanilla.WriteModel(p.character);
 					vanilla.Write(p.unlockState);
-					vanilla.WriteInt(p.maxMultiplayerAscensionUnlocked);
+					vanilla.WriteInt(p.maxStandardAscension, 8);
+					vanilla.WriteInt(p.maxBlitzAscension, 8);
+					vanilla.WriteBool(p.isRotatingDread);
+					vanilla.WriteBool(p.isModded);
 					vanilla.WriteBool(p.isReady);
 					if (!vanilla.Buffer.AsSpan(0, vanilla.BytePosition).SequenceEqual(bytes))
 						throw new Exception($"slot {slot} no longer matches the game's own encoding");
@@ -314,7 +322,7 @@ static class PortMp
 		int fakes = Math.Min(FileAccess.GetFileAsString(PreviewFlag).Trim().ToInt(), MaxPlayers - 1);
 		DirAccess.RemoveAbsolute(ProjectSettings.GlobalizePath(PreviewFlag)); // one-shot
 		for (int i = 0; i < fakes; i++)
-			list.OnPlayerConnected(new LobbyPlayer
+			list.OnPlayerConnected(new StartRunLobbyPlayer
 			{
 				id = 900001UL + (ulong)i, slotId = i + 1, character = ModelDb.Character<Ironclad>(),
 				unlockState = new SerializableUnlockState(),
