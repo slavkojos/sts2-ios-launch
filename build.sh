@@ -2,7 +2,8 @@
 # Builds Slay the Spire 2 for iPhone/iPad from your own copy of the game. See README.md.
 set -euo pipefail
 
-TESTED_GAME_VERSION="v0.107.1"
+TESTED_GAME_VERSION="v0.107.1" # Steam's public branch
+TESTED_BETA_VERSION="v0.113.1" # Steam's public-beta branch
 GODOT_VERSION="4.5.1"
 DOTNET_VERSION="9.0.318"
 GDRE_VERSION="2.7.0"
@@ -162,9 +163,9 @@ if [[ -n "$INFO" ]]; then GAME_VERSION="$(python3 -c 'import json,sys; print(jso
 echo "Game: $GAME_VERSION"
 echo "      $PCK"
 echo "      $GAME_DATA"
-if [[ "$GAME_VERSION" != "$TESTED_GAME_VERSION" ]]; then
-	echo "warning: this was tested with $TESTED_GAME_VERSION (Steam's public branch). Other versions may fail to"
-	echo "         patch, and multiplayer needs every player on the same version."
+if [[ "$GAME_VERSION" != "$TESTED_GAME_VERSION" && "$GAME_VERSION" != "$TESTED_BETA_VERSION" ]]; then
+	echo "warning: this was tested with $TESTED_GAME_VERSION (Steam's public branch) and $TESTED_BETA_VERSION (its beta)."
+	echo "         Other versions may fail to patch, and multiplayer needs every player on the same version."
 fi
 SHORT_VERSION="${GAME_VERSION#v}"
 
@@ -278,6 +279,26 @@ if [[ ! -f "$TOOLS/spine/.ok-ios-${SPINE_SRC_COMMIT:0:12}-$SPINE_PATCH_ID" ]]; t
 	rm -rf "$S"
 	touch "$TOOLS/spine/.ok-ios-${SPINE_SRC_COMMIT:0:12}-$SPINE_PATCH_ID"
 fi
+# Godot 4.5.1's background loading can run one load on two threads at once when a load needs a file that an older
+# background load is still reading (godotengine/godot#118085, fixed in Godot 4.7 by #118824). The two threads then
+# corrupt memory, and the game crashes minutes later, typically while entering a room. Build the iOS engine from the
+# same 4.5.1 sources with src/engine/threaded-load-race.patch, a backport of that fix, built like Godot's own.
+ENGINE_PATCH_ID="$(cat "$ROOT"/src/engine/*.patch | shasum | cut -c1-12)"
+ENGINE_IOS_LIB="$TOOLS/engine/libgodot.ios.template_release.arm64.a"
+if [[ ! -f "$TOOLS/engine/.ok-$GODOT_VERSION-$ENGINE_PATCH_ID" ]]; then
+	step "Building the Godot $GODOT_VERSION iOS engine from source with crash fixes (once; 10-30 min)"
+	E="$TOOLS/engine-build"; rm -rf "$E" "$TOOLS/engine" && mkdir -p "$E" "$TOOLS/engine"
+	run engine-clone git clone -q --depth 1 --branch "$GODOT_VERSION-stable" https://github.com/godotengine/godot.git "$E/godot"
+	for p in "$ROOT"/src/engine/*.patch; do run engine-patch git -C "$E/godot" apply "$p"; done
+	run engine-venv python3 -m venv "$E/venv"
+	run engine-scons-install "$E/venv/bin/pip" install -q "scons==4.11.1"
+	(cd "$E/godot" && run engine-scons "$E/venv/bin/scons" -j"$(sysctl -n hw.ncpu)" platform=ios arch=arm64 target=template_release \
+		production=yes lto=none module_mono_enabled=yes \
+		APPLE_TOOLCHAIN_PATH="$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain" IOS_SDK_PATH="$IOS_SDK")
+	cp "$E/godot/bin/libgodot.ios.template_release.arm64.a" "$ENGINE_IOS_LIB"
+	rm -rf "$E"
+	touch "$TOOLS/engine/.ok-$GODOT_VERSION-$ENGINE_PATCH_ID"
+fi
 TOOLS_ID="godot $GODOT_VERSION dotnet $DOTNET_VERSION gdre $GDRE_VERSION fmod $FMOD_GDE_VERSION spine $SPINE_VERSION ios ${SPINE_SRC_COMMIT:0:12} $SPINE_PATCH_ID"
 PCK_ID="$(stat -f '%z %m' "$PCK") $PCK"
 
@@ -311,10 +332,11 @@ if ! up_to_date icon "$FP" || [[ ! -f "$WORK/icon.png" ]]; then
 fi
 
 # ---------------------------------------------------------------------------------------------------- Xcode project
-# Export an empty Godot C# project (named like the game's assembly) as an Xcode project: this provides the stock
-# Godot 4.5.1 iOS engine with FMOD and Spine. The game's code and data are swapped in afterwards.
+# Export an empty Godot C# project (named like the game's assembly) as an Xcode project: this provides the Godot 4.5.1
+# iOS app with FMOD and Spine (its engine library is swapped for the one built above). The game's code and data are
+# swapped in afterwards.
 X="$WORK/xcode"
-FP="$(fingerprint "$ROOT/src/godot" "$ROOT/src/ios" "$WORK/icon.png" "$EXPORT_TEAM $BUNDLE_ID $SHORT_VERSION plist-bgaudio-scene" "$TOOLS_ID")"
+FP="$(fingerprint "$ROOT/src/godot" "$ROOT/src/ios" "$WORK/icon.png" "$EXPORT_TEAM $BUNDLE_ID $SHORT_VERSION plist-bgaudio-scene-wifiaware" "$TOOLS_ID")"
 if ! up_to_date export "$FP" || [[ ! -d "$X/sts2.xcodeproj" ]]; then
 	step "Exporting the Godot iOS project"
 	P="$WORK/proj"; rm -rf "$P" && mkdir -p "$P/addons"
@@ -346,6 +368,14 @@ if ! up_to_date export "$FP" || [[ ! -d "$X/sts2.xcodeproj" ]]; then
 		-c "Add :UIApplicationSceneManifest:UISceneConfigurations:UIWindowSceneSessionRoleApplication:0:UISceneConfigurationName string Default" \
 		-c "Add :UIApplicationSceneManifest:UISceneConfigurations:UIWindowSceneSessionRoleApplication:0:UISceneDelegateClassName string PortSceneDelegate" \
 		"$X/sts2/sts2-Info.plist"
+	# Wi-Fi Aware: multiplayer between phones in the same room (src/ios/nearby_play.swift). A separate call: PlistBuddy
+	# crashes on exit (after saving) when given all of these at once.
+	/usr/libexec/PlistBuddy -c "Add :WiFiAwareServices dict" -c "Add :WiFiAwareServices:_sts2port._tcp dict" \
+		-c "Add :WiFiAwareServices:_sts2port._tcp:Publishable dict" -c "Add :WiFiAwareServices:_sts2port._tcp:Subscribable dict" \
+		"$X/sts2/sts2-Info.plist"
+	/usr/libexec/PlistBuddy -c "Add :com.apple.developer.wifi-aware array" \
+		-c "Add :com.apple.developer.wifi-aware:0 string Publish" -c "Add :com.apple.developer.wifi-aware:1 string Subscribe" \
+		"$X/sts2/sts2.entitlements"
 	# UIBackgroundModes audio: only used during multiplayer, to keep the game running in the background
 	# (src/native/Port/PortKeepAlive.cs); otherwise the app is suspended as usual.
 	# fmod-gdextension's iOS export plugin doesn't generate its plugin loader under Godot 4.5. Ours also swaps the
@@ -359,6 +389,10 @@ if ! up_to_date export "$FP" || [[ ! -d "$X/sts2.xcodeproj" ]]; then
 fi
 FRAMEWORK="$X/sts2/dylibs/ExportRelease/sts2_aot.xcframework/ios-arm64/sts2.framework"
 [[ -d "$FRAMEWORK" ]] || die "unexpected Godot export layout: $FRAMEWORK missing"
+# The engine built from source above replaces the export template's (the Simulator copy below is made from this one).
+ENGINE_LIB="$X/sts2.xcframework/ios-arm64/libgodot.a"
+[[ -f "$ENGINE_LIB" ]] || die "unexpected Godot export layout: $ENGINE_LIB missing"
+cmp -s "$ENGINE_IOS_LIB" "$ENGINE_LIB" || cp "$ENGINE_IOS_LIB" "$ENGINE_LIB"
 
 # ---------------------------------------------------------------------------------------------------- game code
 # IL-patch the game's sts2.dll (Steam Cloud saves, direct-IP multiplayer, iOS fixes) and stock GodotSharp, then
@@ -381,7 +415,7 @@ if ! up_to_date native "$FP" || [[ ! -f "$WORK/native-out/sts2native.dylib" ]]; 
 	rm -rf "$WORK/patcher" "$WORK/patched" && mkdir -p "$WORK/patched" && cp -R "$ROOT/src/patcher" "$WORK/patcher"
 	(cd "$WORK/patcher" && run patch-godotsharp dotnet run -c Release -- "$GODOTSHARP" "$WORK/patched/GodotSharp.dll")
 	if ! (cd "$WORK/patcher" && run patch-sts2 dotnet run -c Release --no-build -- "$WORK/game-data/sts2.dll" "$WORK/patched/sts2.dll"); then
-		die "patching sts2.dll failed (game version $GAME_VERSION; tested with $TESTED_GAME_VERSION)"
+		die "patching sts2.dll failed (game version $GAME_VERSION; tested with $TESTED_GAME_VERSION and $TESTED_BETA_VERSION)"
 	fi
 	# Gameplay extras (src/extras): build the hook assembly against the patched game, then weave its hooks in.
 	step "Weaving in the extras (Restart Room, save slots, card advisor)"
@@ -397,7 +431,8 @@ if ! up_to_date native "$FP" || [[ ! -f "$WORK/native-out/sts2native.dylib" ]]; 
 	step "Compiling the game for iOS (NativeAOT, takes a few minutes)"
 	rm -rf "$WORK/native" "$WORK/native-out" && cp -R "$ROOT/src/native" "$WORK/native"
 	(cd "$WORK/native" && run native-publish dotnet publish -c Release -o "$WORK/native-out" \
-		-p:GameDataDir="$WORK/game-data" -p:PatchedDir="$WORK/patched" -p:IosSdkPath="$IOS_SDK")
+		-p:GameDataDir="$WORK/game-data" -p:PatchedDir="$WORK/patched" -p:IosSdkPath="$IOS_SDK" \
+		-p:GameApi="$(cat "$WORK/patched/game-api.txt")")
 	[[ -f "$WORK/native-out/sts2native.dylib" ]] || die "NativeAOT produced no library (see $(show "$LOGS/native-publish.log"))"
 	mark_done native "$FP"
 fi
@@ -471,6 +506,22 @@ metal_hooks() { # <sdk> <min-version flag> -> prints the object's path
 	echo "$o"
 }
 
+# Multiplayer between phones in the same room over Wi-Fi Aware (src/ios/nearby_play.swift). Its API is Swift-only, so
+# it's compiled here and linked in with the Swift libraries' search paths. Its two frameworks are weak-linked (and left
+# out of the object's automatic links): on iOS before 26 the app starts without them and the feature stays off.
+nearby_object() { # <sdk> <target> -> prints the object's path
+	local o="$WORK/nearby_play-$1-$(fingerprint "$ROOT/src/ios/nearby_play.swift" | cut -c1-12).o"
+	if [[ ! -f "$o" ]]; then
+		rm -f "$WORK"/nearby_play-"$1"-*.o
+		run "nearby-$1" xcrun -sdk "$1" swiftc -swift-version 5 -parse-as-library -target "$2" -O -module-name PortNearby \
+			-Xfrontend -disable-autolink-framework -Xfrontend WiFiAware \
+			-Xfrontend -disable-autolink-framework -Xfrontend DeviceDiscoveryUI \
+			-c "$ROOT/src/ios/nearby_play.swift" -o "$o"
+	fi
+	echo "$o"
+}
+NEARBY_LDFLAGS='-L$(SDKROOT)/usr/lib/swift -L$(TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME) -weak_framework WiFiAware -weak_framework DeviceDiscoveryUI'
+
 # ---------------------------------------------------------------------------------------------------- Simulator
 # The same app for the iOS Simulator (Apple silicon). The engine, Spine and FMOD libraries and the NativeAOT game
 # code exist only as arm64 device builds here; arm64 Simulators run that code natively, so a copy of the Xcode
@@ -505,11 +556,11 @@ if [[ $SIM -eq 1 ]]; then
 	run sim-retag python3 "$ROOT/tools/arm64_to_sim.py" "$G"
 	run sim-metal xcrun -sdk iphonesimulator clang -arch arm64 -mios-simulator-version-min=14.0 -fobjc-arc \
 		-c "$ROOT/src/ios/simulator_metal.m" -o "$WORK/simulator_metal.o"
-	HOOKS="$(metal_hooks iphonesimulator -mios-simulator-version-min=14.0)"
+	HOOKS="$(metal_hooks iphonesimulator -mios-simulator-version-min=14.0) $(nearby_object iphonesimulator arm64-apple-ios17.0-simulator)"
 	run xcodebuild-sim xcodebuild -project "$SX/sts2.xcodeproj" -scheme sts2 -configuration Release -sdk iphonesimulator \
 		-destination "generic/platform=iOS Simulator" -derivedDataPath "$WORK/sim-derived" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
 		CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO DEVELOPMENT_TEAM= \
-		OTHER_LDFLAGS="-Wl,-U,_fmod_library_init $WORK/simulator_metal.o $HOOKS -framework Metal" build
+		OTHER_LDFLAGS="-Wl,-U,_fmod_library_init $WORK/simulator_metal.o $HOOKS -framework Metal $NEARBY_LDFLAGS" build
 	APP="$WORK/sim-derived/Build/Products/Release-iphonesimulator/sts2.app"
 	[[ -d "$APP" ]] || die "no Simulator app built (see $(show "$LOGS/xcodebuild-sim.log"))"
 	C="$APP/.sts2.pck.clone"
@@ -530,18 +581,19 @@ fi
 
 # ---------------------------------------------------------------------------------------------------- app
 step "Building the app with Xcode"
-HOOKS="$(metal_hooks iphoneos -miphoneos-version-min=17.0)"
+HOOKS="$(metal_hooks iphoneos -miphoneos-version-min=17.0) $(nearby_object iphoneos arm64-apple-ios17.0)"
 XB=(xcodebuild -project "$X/sts2.xcodeproj" -scheme sts2 -configuration Release -destination generic/platform=iOS
-	-derivedDataPath "$WORK/derived" OTHER_LDFLAGS="-Wl,-U,_fmod_library_init $HOOKS -framework Metal")
+	-derivedDataPath "$WORK/derived" OTHER_LDFLAGS="-Wl,-U,_fmod_library_init $HOOKS -framework Metal $NEARBY_LDFLAGS")
 if [[ $UNSIGNED -eq 1 ]]; then
 	run xcodebuild "${XB[@]}" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
 else
 	XB+=(-allowProvisioningUpdates -allowProvisioningDeviceRegistration DEVELOPMENT_TEAM="$TEAM" build)
 	if ! "${XB[@]}" > "$LOGS/xcodebuild.log" 2>&1; then
-		if grep -qiE "personal development team|increased-memory-limit|Increased Memory Limit" "$LOGS/xcodebuild.log"; then
-			# Free (personal) teams can't use the increased memory limit entitlement.
-			echo "    (your team can't use the increased memory limit; building without it)"
+		if grep -qiE "personal development team|increased-memory-limit|Increased Memory Limit|wifi-aware|Wi-Fi Aware" "$LOGS/xcodebuild.log"; then
+			# Free (personal) teams can't use the increased memory limit or Wi-Fi Aware entitlements.
+			echo "    (your team can't use the increased memory limit or Wi-Fi Aware; building without them)"
 			/usr/libexec/PlistBuddy -c "Delete :com.apple.developer.kernel.increased-memory-limit" "$X/sts2/sts2.entitlements" || true
+			/usr/libexec/PlistBuddy -c "Delete :com.apple.developer.wifi-aware" "$X/sts2/sts2.entitlements" || true
 			run xcodebuild "${XB[@]}"
 		else
 			echo "---- errors from $(show "$LOGS/xcodebuild.log") ----" >&2; grep -E "error:|BUILD FAILED" "$LOGS/xcodebuild.log" | tail -n 20 >&2
